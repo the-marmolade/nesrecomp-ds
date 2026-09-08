@@ -1,0 +1,9 @@
+build/
+nitrofiles/
+*.nds
+*.elf
+*.map
+*.lst
+build.log
+coverage.txt
+source/mapper.c
