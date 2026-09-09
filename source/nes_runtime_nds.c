@@ -19,6 +19,8 @@ extern void apu_write(uint16_t addr, uint8_t val);
 extern uint8_t apu_read_status(void);
 extern void apu_trace_dump_now(void);
 extern void apu_trace_start(void);
+extern void power_check_lid(void);
+extern void ui_frame(void);
 extern void apu_test_tone_toggle(void);
 extern unsigned apu_state_size(void);
 extern void apu_state_save(void *dst);
@@ -373,11 +375,9 @@ static void poll_input(void) {
     if ((k & KEY_R) && (keysDown() & KEY_SELECT)) apu_trace_start();
     if ((k & KEY_R) && (keysDown() & KEY_L))      apu_trace_dump_now();
 
-    /* R + X saves, R + Y loads. Held R avoids accidental presses mid-jump. */
-    if ((k & KEY_R) && (keysDown() & KEY_X))
-        iprintf(nes_save_state() ? "state saved\n" : "save failed\n");
-    if ((k & KEY_R) && (keysDown() & KEY_Y))
-        iprintf(nes_load_state() ? "state loaded\n" : "load failed\n");
+    /* Save and load moved to the touch screen (see ui_nds.c). The old R+X /
+     * R+Y combos are gone: undiscoverable, and loading fired instantly with
+     * no confirmation, so a mistimed press wiped your progress. */
 }
 
 void nes_timing_init(void) { timing_init(); }
@@ -434,6 +434,8 @@ void maybe_trigger_vblank(int cycles) {
      * BG map and all of OAM; doing that while the display is scanning them out
      * tears and flickers. func_NMI() is most of a frame's work, so waiting
      * first (as this used to) put the writes right in the middle of display. */
+    power_check_lid();      /* sleeps here if the lid is shut */
+    ui_frame();             /* touch save/load; blocks while confirming */
     video_build();          /* heavy work: RAM shadows, outside vblank */
     apu_frame();
 
@@ -474,6 +476,12 @@ void maybe_trigger_vblank(int cycles) {
                     (unsigned long)(s_fps / 100), (unsigned long)(s_fps % 100),
                     (unsigned long)(s_work_us / 1000),
                     (unsigned long)((s_work_us % 1000) / 10));
+            {   extern volatile unsigned g_hblank_hits;
+                extern int g_original_mode;
+                iprintf("hblank %u  orig=%d      \n",
+                        g_hblank_hits, g_original_mode);
+                g_hblank_hits = 0;
+            }
             iprintf("om=%02X ot=%02X srt=%02X ges=%02X  \n",
                     g_ram[0x0770], g_ram[0x0772], g_ram[0x073C], g_ram[0x000E]);
             /* Should read ~60.1, not 59.8, once rate matching is working. */

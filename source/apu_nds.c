@@ -376,6 +376,20 @@ void apu_init(void) {
     s_ready = 1;
 }
 
+/* Silence every channel. Needed whenever the frame loop stops - a pause
+ * dialog, or sleeping on lid close - because the channels go on playing
+ * whatever they were last set to, which comes out as a stuck tone. Nothing
+ * has to be restored afterwards: apu_frame() reprograms frequency and volume
+ * from the game's own register state on the next frame. */
+void apu_silence(void) {
+    if (!s_ready) return;
+    soundSetVolume(s_ch_p1,  0);
+    soundSetVolume(s_ch_p2,  0);
+    soundSetVolume(s_ch_tri, 0);
+    soundSetVolume(s_ch_nz,  0);
+    soundSetVolume(s_ch_dmc, 0);
+}
+
 /* Play a steady A440 on pulse 1 and stop the game driving the channels, so
  * PSG_SCALE can be checked against any reference tone. Correct: a clean A
  * above middle C. An octave or three out means PSG_SCALE is wrong. */

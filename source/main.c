@@ -13,6 +13,8 @@ extern int  nes_rom_load(const char *path);
 extern void video_init(void);
 extern void nes_timing_init(void);
 extern void apu_init(void);
+extern void power_init(void);
+extern int  ui_select_mode(void);
 extern int  g_fat_ready;
 
 static void *const g_entry_anchors[] = {
@@ -57,10 +59,15 @@ int main(void) {
             while (1) swiWaitForVBlank();
         }
     }
+    /* Ask before initialising video: the two modes set the hardware up
+     * differently, and original mode never creates the sub-screen HUD. */
+    ui_select_mode();
+
     video_init();
     nes_timing_init();
     apu_init();
-    iprintf("L: debug overlay   R+X: save   R+Y: load\n");
+    power_init();
+
 
     func_RESET();
     iprintf("RESET returned (unexpected)\n");

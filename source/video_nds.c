@@ -12,6 +12,57 @@
 #include <string.h>
 #include "nes_runtime.h"
 #include "game_config.h"
+#include "display_mode.h"
+
+
+/* Original mode has to fit 240 NES lines onto a 192-line panel, and there is
+ * no framebuffer to scale. Instead an HBlank interrupt advances the
+ * background's vertical scroll by one line every four scanlines, so every
+ * fifth NES line is skipped as the screen draws: 240 * 4/5 = 192 exactly.
+ *
+ * That costs one line in five, which is visible on fine detail - the trade
+ * for showing the frame the way the NES did, HUD and all. Arranged mode
+ * keeps every pixel by putting the HUD on the sub screen instead. */
+static int s_scroll_y_base;
+static int s_scroll_x;          /* playfield scroll, set once per frame */
+
+volatile unsigned g_hblank_hits;   /* diagnostic: is the handler running? */
+
+static void hblank_squeeze(void) {
+    g_hblank_hits++;
+    int v = REG_VCOUNT;
+    if (v >= 192) return;
+
+    /* Vertical: 240 NES lines cannot fit 192 without loss, so the question is
+     * only what to give up. Scaling the background costs sharpness AND leaves
+     * sprites the wrong size, because OAM cannot scale a multi-tile character
+     * without tearing it apart. Cropping costs visible area but nothing else:
+     * every pixel that IS shown is exactly what the NES drew.
+     *
+     *   lines   0..31    HUD, 1:1
+     *   lines  80..239   playfield, 1:1 - the top 48 lines of sky are cut
+     *
+     * SMB puts nothing but sky and the occasional cloud up there, and Mario's
+     * jump apex stays below it, so the crop is rarely noticed. */
+    /* The HUD's 32 lines are always shown 1:1 - it is nearly all text, which
+     * is exactly what line-dropping ruins - and the loss falls on the
+     * playfield below it, one way or the other.
+     *
+     * 208 playfield lines become 156: an exact 3/4, so every 16-pixel block
+     * loses the same 4 lines and they all come out matching. An uneven ratio
+     * (160/208) left blocks at different heights, which looked worse than the
+     * 4 blank lines this leaves at the bottom of the screen. */
+    int off = (v < 32) ? 0 : (v - 32) / 3;
+    REG_BG0VOFS = (u16)(s_scroll_y_base + off);
+
+    /* Horizontal: this is the mid-frame scroll split. SMB's status bar does
+     * not scroll but the playfield does, and on the NES the game changes the
+     * scroll partway down the frame at the sprite-0 hit. Arranged mode dodges
+     * this by putting the HUD on the other screen; here both share one
+     * background, so the split has to happen per scanline or the HUD slides
+     * around with the level. */
+    REG_BG0HOFS = (u16)(v < 32 ? 0 : s_scroll_x);
+}
 
 
 static int      s_bg;
@@ -80,14 +131,36 @@ void video_init(void) {
     s_bg  = bgInit(0, BgType_Text4bpp, BgSize_T_512x256, 0, 2);
     s_map = (u16 *)bgGetMapPtr(s_bg);
 
+    if (g_original_mode) {
+        irqSet(IRQ_HBLANK, hblank_squeeze);
+        irqEnable(IRQ_HBLANK);
+        /* irqEnable registers the handler with the interrupt controller, but
+         * the display controller also has to be told to raise HBlank at all.
+         * Without this bit the handler is installed and never called - which
+         * is exactly what the diagnostic counter showed. */
+#ifdef DISP_HBLANK_IRQ
+        REG_DISPSTAT |= DISP_HBLANK_IRQ;
+#else
+        REG_DISPSTAT |= (1 << 4);
+#endif
+    }
+
     oamInit(&oamMain, SpriteMapping_1D_32, false);
+
+    /* Sprites are NOT affine-scaled in original mode, though it is tempting.
+     * OAM scales each 8x8 sprite about its own centre, and almost every SMB
+     * character is built from several sprites side by side - so scaling pulls
+     * the halves apart and leaves a seam straight down the middle of Mario.
+     * Position-only scaling keeps them whole at the cost of being a line
+     * taller than the squeezed background expects. */
     convert_chr((u16 *)bgGetGfxPtr(s_bg), (u16 *)SPRITE_GFX);
 
     /* Status bar on the sub screen. consoleDemoInit owns sub BG0 with map
      * base 31 and tile base 0. mapBase is 5 bits (0-31) and tileBase 4 bits
      * (0-15), so: map base 30 = 60-62KB, tile base 2 = 32-48KB. Neither
      * collides with the console or with each other. */
-    s_bg_hud  = bgInitSub(1, BgType_Text4bpp, BgSize_T_256x256, 30, 2);
+    if (!g_original_mode)
+        s_bg_hud = bgInitSub(1, BgType_Text4bpp, BgSize_T_256x256, 30, 2);
     s_map_hud = (u16 *)bgGetMapPtr(s_bg_hud);
     convert_chr_bg((u16 *)bgGetGfxPtr(s_bg_hud));
     bgSetScroll(s_bg_hud, 0, 0);
@@ -123,7 +196,6 @@ static void push_nametable(const u8 *nt, u16 *map, int bg_tile_base) {
 static u16 s_shadow[2048];      /* 512x256 text BG = two 32x32 screenblocks */
 static u16 s_shadow_hud[128];   /* 4 rows x 32 cols */
 static u16 s_pal_bg[64], s_pal_spr[64], s_pal_sub[128];
-static int s_scroll_x;
 
 static void build_nametable(const u8 *nt, u16 *dst, int bg_tile_base) {
     for (int row = 0; row < 30; row++)
@@ -176,20 +248,26 @@ void video_build(void) {
     }
 
     s_scroll_x = g_ppuscroll_x + ((g_ppuctrl & 1) ? 256 : 0);
+    s_scroll_y_base = g_original_mode ? 0 : g_game->top_line;
 
     /* oamSet writes into libnds' RAM copy; oamUpdate DMAs it in vblank. */
     for (int i = 0; i < 64; i++) {
         const u8 *o = &g_ppu_oam[i * 4];
-        int y = o[0] + 1 - g_game->top_line;
+        int ny = o[0] + 1;
+        int y;
+        if (!g_original_mode)      y = ny - g_game->top_line;
+        else if (ny < 32) y = ny;                       /* HUD, 1:1 */
+        else              y = 32 + (ny - 32) * 3 / 4;   /* playfield, 3/4 */
         int x = o[3];
         u8  tile = o[1], attr = o[2];
+        int hflip = (attr & 0x40) != 0;
+        int vflip = (attr & 0x80) != 0;
         int hidden = (o[0] >= 0xEF) || (y < -8) || (y > 192);
         oamSet(&oamMain, i, x, y,
                (attr & 0x20) ? 2 : 0, attr & 3,
                SpriteSize_8x8, SpriteColorFormat_16Color,
                (u8 *)SPRITE_GFX + (spr_base + tile) * 32,
-               -1, false, hidden,
-               (attr & 0x40) != 0, (attr & 0x80) != 0, false);
+               -1, false, hidden, hflip, vflip, false);
     }
 }
 
@@ -197,11 +275,17 @@ void video_build(void) {
 void video_flush(void) {
     if (!s_inited) return;
     dmaCopy(s_shadow,     s_map,          sizeof s_shadow);
-    dmaCopy(s_shadow_hud, s_map_hud,      sizeof s_shadow_hud);
+    if (!g_original_mode)
+        dmaCopy(s_shadow_hud, s_map_hud, sizeof s_shadow_hud);
     dmaCopy(s_pal_bg,     BG_PALETTE,     sizeof s_pal_bg);
     dmaCopy(s_pal_spr,    SPRITE_PALETTE, sizeof s_pal_spr);
-    dmaCopy(s_pal_sub,    BG_PALETTE_SUB, sizeof s_pal_sub);
-    bgSetScroll(s_bg, s_scroll_x, g_game->top_line);
-    bgUpdate();
+    if (!g_original_mode)
+        dmaCopy(s_pal_sub, BG_PALETTE_SUB, sizeof s_pal_sub);
+    /* In original mode the HBlank handler drives both scroll registers every
+     * scanline; writing them here as well just fights it. */
+    if (!g_original_mode) {
+        bgSetScroll(s_bg, s_scroll_x, s_scroll_y_base);
+        bgUpdate();
+    }
     oamUpdate(&oamMain);
 }
