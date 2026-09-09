@@ -21,19 +21,15 @@ four worlds played on a DSpico flashcart with no graphical glitches.
 
 ## Layout
 
-This runner is not standalone — it compiles the C that nesrecomp generates for
-a specific game. Clone it *inside* a game project:
+Self-contained. `nesrecomp` is a submodule; each ported game's recompiled C
+lands under `games/<name>/generated/`.
 
 ```
-SuperMarioBrosNESRecomp/
-  generated/            recompiled C
+nesrecomp-ds/
   nesrecomp/            submodule
-  nesrecomp-ds/         this repo
+  games/<name>/         recompiled C, written by tools/port.sh
+  source/  include/     the runner
 ```
-
-Or point it elsewhere with `make GAME_DIR=../path/to/game-project`.
-`GAME_DIR` must be relative — the devkitARM template prefixes source and
-include paths with `$(CURDIR)`.
 
 ## Building
 
@@ -46,12 +42,10 @@ sudo dkp-pacman -S nds-dev
 then:
 
 ```
-git clone https://github.com/mstan/SuperMarioBrosNESRecomp
-cd SuperMarioBrosNESRecomp && ./setup.sh
-git clone https://github.com/the-marmolade/nesrecomp-ds
+git clone --recurse-submodules https://github.com/the-marmolade/nesrecomp-ds
 cd nesrecomp-ds
-bash tools/fetch_deps.sh    # copies mapper.c from the nesrecomp submodule
-make
+bash tools/fetch_deps.sh
+bash tools/port.sh /path/to/rom.nes smb
 ```
 
 ## Supplying the ROM
@@ -79,6 +73,20 @@ white screen.
 | D-pad, A, B, Start, Select | as labelled |
 | L | fps / debug overlay |
 | R + X / R + Y | save / load state |
+
+## Porting a new game
+
+```
+bash tools/port.sh /path/to/rom.nes donkey-kong dk
+```
+
+That builds the recompiler if needed, writes a minimal `game.toml`,
+recompiles the ROM's 6502 into C under `games/<name>/generated/`, and builds
+the DS binary against it. Set `NESRECOMP=/path/to/nesrecomp` if your checkout
+isn't at `../smbrecomp/nesrecomp`.
+
+The third argument selects which entry in `source/game_config.c` to compile
+in. A new game needs an entry there before it will look right — see below.
 
 ## Adding a game
 

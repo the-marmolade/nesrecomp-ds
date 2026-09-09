@@ -15,9 +15,33 @@
  */
 #include <nds.h>
 #include <string.h>
+#include <stdio.h>
 #include "nes_runtime.h"
 
 #define NES_CPU_HZ 1789773
+
+/* The DS sound timer wants a value derived from the desired frequency, and
+ * the multiplier differs per channel type. PSG_SCALE was inferred from the
+ * timer maths (the square divides by 8 to build its duty cycle) and never
+ * verified against hardware - if every note is three octaves out, this is
+ * why. apu_test_tone() plays a known A440 so it can be checked by ear
+ * instead of by argument. */
+#define PSG_SCALE   8
+#define NOISE_SCALE 1
+
+/* Master gain applied to every channel after the per-channel balance below.
+ * The balance was tuned against a Mesen recording until all four frequency
+ * bands matched within 4%; scaling everything by the same factor preserves
+ * that while fixing the absolute level, which measured ~7x quieter than the
+ * reference. Raise this, not the individual channels - changing them
+ * separately would undo the balance. Back off if anything distorts. */
+#define MASTER_GAIN_NUM 5
+#define MASTER_GAIN_DEN 4
+
+static inline u8 mix(int v) {
+    v = v * MASTER_GAIN_NUM / MASTER_GAIN_DEN;
+    return (u8)(v > 127 ? 127 : v);
+}
 
 static const uint8_t s_len_table[32] = {
     10,254, 20,  2, 40,  4, 80,  6,160,  8, 60, 10, 14, 12, 26, 14,
@@ -49,6 +73,8 @@ static struct {
 } s_tri;
 
 static int s_seq_step;
+static int s_dmc_level, s_dmc_energy, s_ch_dmc = -1;
+
 static int s_ch_p1 = -1, s_ch_p2 = -1, s_ch_tri = -1, s_ch_nz = -1;
 static int8_t s_tri_wave[32];
 static int s_ready;
@@ -63,7 +89,61 @@ static void chan_write(Chan *c, int idx, uint8_t val) {
     }
 }
 
+/* --- register trace -------------------------------------------------------
+ * Log every APU register write with its frame number. The recompiled game is
+ * identical on DS and PC, so this stream is identical too - which makes it a
+ * ground truth the offline comparison tool can replay through a reference NES
+ * APU model and diff against what this file computes. Enable with
+ * apu_trace_start(); dumps to /apu_trace.txt when the buffer fills. */
+#define TRACE_MAX 8192
+static struct { uint32_t frame; uint16_t addr; uint8_t val; } s_tr[TRACE_MAX];
+static int s_tr_n, s_tr_on, s_tr_done;
+extern uint64_t g_frame_count;
+
+/* Tracing is opt-in. It used to start automatically from main(), but the
+ * console output that goes with it interferes with audio recording sessions,
+ * and the trace has already served its purpose (it proved the frequencies
+ * and envelopes are correct). Call this from R+Select if you need another. */
+void apu_trace_start(void) { s_tr_n = 0; s_tr_on = 1; s_tr_done = 0; }
+
+int apu_trace_count(void) { return s_tr_n; }
+
+/* Dump on demand rather than only when the buffer fills: how many APU writes
+ * a game makes per second varies a lot, and waiting for 8192 can mean playing
+ * for minutes with no idea whether anything is being recorded. */
+void apu_trace_dump_now(void);
+
+static void apu_trace_dump(void) {
+    FILE *f = fopen("/apu_trace.txt", "w");
+    if (!f) { iprintf("apu trace: write failed\n"); s_tr_done = 1; return; }
+    for (int i = 0; i < s_tr_n; i++)
+        fprintf(f, "%lu %04X %02X\n", (unsigned long)s_tr[i].frame,
+                s_tr[i].addr, s_tr[i].val);
+    fclose(f);
+    iprintf("apu trace: %d writes\n", s_tr_n);
+    s_tr_done = 1;
+}
+
+void apu_trace_dump_now(void) {
+    if (s_tr_done) { iprintf("apu trace: already written\n"); return; }
+    if (s_tr_n == 0) { iprintf("apu trace: nothing recorded\n"); return; }
+    apu_trace_dump();
+}
+
+static void push_noise(int ch);
+static int  s_test_tone;
+
 void apu_write(uint16_t addr, uint8_t val) {
+    if (s_tr_on && !s_tr_done) {
+        if (s_tr_n < TRACE_MAX) {
+            s_tr[s_tr_n].frame = (uint32_t)g_frame_count;
+            s_tr[s_tr_n].addr  = addr;
+            s_tr[s_tr_n].val   = val;
+            s_tr_n++;
+        } else {
+            apu_trace_dump();
+        }
+    }
     switch (addr) {
     case 0x4000: case 0x4001: case 0x4002: case 0x4003:
         chan_write(&s_p1, addr - 0x4000, val); break;
@@ -80,6 +160,21 @@ void apu_write(uint16_t addr, uint8_t val) {
         break;
     case 0x400C: case 0x400E: case 0x400F:
         chan_write(&s_noise, addr - 0x400C, val); break;
+    case 0x4011:
+        /* Direct DAC write. A trace taken while breaking blocks caught 443
+         * writes here, all zero - so on the evidence SMB does not use this
+         * for sound and the thump below contributes nothing. Kept because
+         * removing it, together with sub-frame channel updates, made several
+         * effects worse rather than better; revisit with a trace that
+         * isolates one effect at a time. */
+        {
+            int v = val & 0x7F;
+            int d = v - s_dmc_level;
+            if (d < 0) d = -d;
+            s_dmc_energy += d;
+            s_dmc_level = v;
+        }
+        return;
     case 0x4015:
         s_p1.enabled    = val & 1;
         s_p2.enabled    = val & 2;
@@ -92,6 +187,23 @@ void apu_write(uint16_t addr, uint8_t val) {
         break;
     default: break;
     }
+
+    /* Noise only, and only on write.
+     *
+     * Music tolerates a 60Hz update rate; short effects do not. A trace taken
+     * while breaking a block showed the noise channel swept through 16 writes
+     * across a few frames - volume descending 30,29,26,25,23 and the period
+     * index jumping 13,12,6,14,8. Updating once per frame keeps only the last
+     * value in each, collapsing a shattering sweep into one flat burst, which
+     * is why the effect sounds like a different sound rather than a broken
+     * one.
+     *
+     * Deliberately limited to noise: applying this to the pulse channels made
+     * the music rasp, because every soundSetFreq() resets the channel phase
+     * and the game rewrites pulse registers constantly while a note holds.
+     * Noise has no pitch to lose phase on. */
+    if (s_ready && !s_test_tone && addr >= 0x400C && addr <= 0x400F)
+        push_noise(s_ch_nz);
 }
 
 uint8_t apu_read_status(void) {
@@ -158,8 +270,13 @@ static void push_pulse(Chan *c, int ch, int is_p1) {
      * and is meant to be inaudible anyway. */
     if (hz < 20 || hz > 8191) { soundSetVolume(ch, 0); return; }
 
-    soundSetFreq(ch, (u16)(hz * 8));
-    soundSetVolume(ch, (u8)(vol * 85 / 15));
+    /* Two spectrum comparisons against Mesen both showed the pulses carrying
+     * far more of the total than the NES gives them - 39% then 43%, against
+     * a reference of 24-29%. 38 measured 25.9% when the other channels were
+     * quiet and 16.0% when they were loud, so it moves up slightly to hold
+     * its share once triangle and noise settle. */
+    soundSetFreq(ch, (u16)(hz * PSG_SCALE));
+    soundSetVolume(ch, mix(vol * 50 / 15));
 }
 
 static void push_triangle(int ch) {
@@ -171,16 +288,13 @@ static void push_triangle(int ch) {
     int hz = NES_CPU_HZ / (32 * (period + 1));
     if (hz < 20 || hz > 2000) { soundSetVolume(ch, 0); return; }
 
-    soundSetFreq(ch, (u16)(hz * 32));     /* PCM: freq param is the sample rate */
-    soundSetVolume(ch, 65);               /* NES triangle has no volume control */
-}
 
-/* The PSG square divides its timer by 8 to build the duty cycle, so it wants
- * 8 * Hz. The noise LFSR advances once per timer tick, so it wants the clock
- * rate directly. Passing 8x here made every drum hiss at the same pitch.
- * If percussion still sounds wrong, try 8 — this is the one scaling factor
- * I'm least sure of. */
-#define NOISE_SCALE 1
+    /* The triangle carries the bass line and has no volume control on the
+     * NES. Bracketed by measurement across three runs: 68 -> 11.6% of total
+     * energy, 88 -> 14.4%, 127 -> 41.5%, against a reference of 21.8%. */
+    soundSetFreq(ch, (u16)(hz * 32));    /* PCM: freq param is the sample rate */
+    soundSetVolume(ch, mix(99));
+}
 
 static void push_noise(int ch) {
     int vol = chan_volume(&s_noise);
@@ -188,9 +302,16 @@ static void push_noise(int ch) {
 
     int hz = NES_CPU_HZ / s_noise_period[s_noise.reg[2] & 0x0F];
     hz *= NOISE_SCALE;
+    /* Short noise periods clock the LFSR far past anything the DS channel can
+     * reach - index 0 is ~447kHz. Cap rather than mute: up there the NES is
+     * producing broadband hiss anyway, and silence is audibly wrong where
+     * hiss is merely approximate. The register trace showed this muting 18%
+     * of frames. */
     if (hz > 65535) hz = 65535;
+    /* Bracketed the same way: 62 -> 20.3%, 90 -> 45.1%, 112 -> 51.4%,
+     * against a reference of 37.5%. */
     soundSetFreq(ch, (u16)hz);
-    soundSetVolume(ch, (u8)(vol * 60 / 15));
+    soundSetVolume(ch, mix(vol * 80 / 15));
 }
 
 /* ---------- save state ---------- */
@@ -245,19 +366,40 @@ void apu_init(void) {
     /* Start every channel silent and keep it alive; per-frame updates then
      * only change frequency and volume, which is far cheaper than starting
      * and stopping channels. */
-    s_ch_p1  = soundPlayPSG(DutyCycle_50, 440 * 8, 0, 64);
-    s_ch_p2  = soundPlayPSG(DutyCycle_50, 440 * 8, 0, 64);
+    s_ch_p1  = soundPlayPSG(DutyCycle_50, 440 * PSG_SCALE, 0, 64);
+    s_ch_p2  = soundPlayPSG(DutyCycle_50, 440 * PSG_SCALE, 0, 64);
     s_ch_nz  = soundPlayNoise(1000 * 8, 0, 64);
     s_ch_tri = soundPlaySample(s_tri_wave, SoundFormat_8Bit, sizeof s_tri_wave,
                                440 * 32, 0, 64, true, 0);
+    s_ch_dmc = soundPlaySample(s_tri_wave, SoundFormat_8Bit, sizeof s_tri_wave,
+                               70 * 32, 0, 64, true, 0);
     s_ready = 1;
+}
+
+/* Play a steady A440 on pulse 1 and stop the game driving the channels, so
+ * PSG_SCALE can be checked against any reference tone. Correct: a clean A
+ * above middle C. An octave or three out means PSG_SCALE is wrong. */
+
+void apu_test_tone_toggle(void) {
+    s_test_tone = !s_test_tone;
+    if (s_test_tone) {
+        soundSetFreq(s_ch_p1, (u16)(440 * PSG_SCALE));
+        soundSetVolume(s_ch_p1, 90);
+        soundSetVolume(s_ch_p2, 0);
+        soundSetVolume(s_ch_tri, 0);
+        soundSetVolume(s_ch_nz, 0);
+        soundSetVolume(s_ch_dmc, 0);
+        iprintf("test tone: A440 (PSG_SCALE=%d)\n", PSG_SCALE);
+    } else {
+        iprintf("test tone: off\n");
+    }
 }
 
 /* Called once per NES frame. The APU frame sequencer runs at 240Hz, so step
  * it four times per video frame: envelopes every step, length counters and
  * sweep on steps 1 and 3 (the half-frames). */
 void apu_frame(void) {
-    if (!s_ready) return;
+    if (!s_ready || s_test_tone) return;
 
     for (int i = 0; i < 4; i++) {
         clock_envelope(&s_p1);
@@ -286,8 +428,18 @@ void apu_frame(void) {
     static uint8_t last_d1 = 0xFF, last_d2 = 0xFF;
     uint8_t d1 = s_duty_map[(s_p1.reg[0] >> 6) & 3];
     uint8_t d2 = s_duty_map[(s_p2.reg[0] >> 6) & 3];
-    if (d1 != last_d1) { soundKill(s_ch_p1); s_ch_p1 = soundPlayPSG(d1, 440 * 8, 0, 64); last_d1 = d1; }
-    if (d2 != last_d2) { soundKill(s_ch_p2); s_ch_p2 = soundPlayPSG(d2, 440 * 8, 0, 64); last_d2 = d2; }
+    if (d1 != last_d1) { soundKill(s_ch_p1); s_ch_p1 = soundPlayPSG(d1, 440 * PSG_SCALE, 0, 64); last_d1 = d1; }
+    if (d2 != last_d2) { soundKill(s_ch_p2); s_ch_p2 = soundPlayPSG(d2, 440 * PSG_SCALE, 0, 64); last_d2 = d2; }
+
+    if (s_dmc_energy > 0) {
+        int v = s_dmc_energy * 2;
+        if (v > 90) v = 90;
+        soundSetVolume(s_ch_dmc, mix(v));
+        s_dmc_energy = s_dmc_energy * 2 / 3;
+        if (s_dmc_energy < 2) s_dmc_energy = 0;
+    } else {
+        soundSetVolume(s_ch_dmc, 0);
+    }
 
     push_pulse(&s_p1, s_ch_p1, 1);
     push_pulse(&s_p2, s_ch_p2, 0);

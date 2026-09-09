@@ -13,6 +13,11 @@
 typedef struct {
     const char *name;
 
+    /* Filename to look for, on the SD card root or inside nitrofiles/.
+     * Without this the runner would only ever load "smb.nes", whatever game
+     * it was actually built for. */
+    const char *rom_file;
+
     /* First NES scanline shown on the DS top screen. The NES is 240 lines and
      * the DS is 192, so something has to give. For a game with a fixed status
      * bar at the top, showing lines [top_line, top_line+192) puts the

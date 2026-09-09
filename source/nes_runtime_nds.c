@@ -17,6 +17,9 @@ extern void apu_init(void);
 extern void apu_frame(void);
 extern void apu_write(uint16_t addr, uint8_t val);
 extern uint8_t apu_read_status(void);
+extern void apu_trace_dump_now(void);
+extern void apu_trace_start(void);
+extern void apu_test_tone_toggle(void);
 extern unsigned apu_state_size(void);
 extern void apu_state_save(void *dst);
 extern void apu_state_load(const void *src);
@@ -361,6 +364,14 @@ static void poll_input(void) {
         s_debug_on = !s_debug_on;
         if (!s_debug_on) iprintf("\x1b[2J");   /* clear on the way out */
     }
+
+    /* R + B toggles a known A440 test tone, for checking PSG_SCALE. */
+    if ((k & KEY_R) && (keysDown() & KEY_B)) apu_test_tone_toggle();
+
+    /* R + Select arms APU tracing, R + L writes it out. Not on by default:
+     * the console chatter gets in the way of audio recording. */
+    if ((k & KEY_R) && (keysDown() & KEY_SELECT)) apu_trace_start();
+    if ((k & KEY_R) && (keysDown() & KEY_L))      apu_trace_dump_now();
 
     /* R + X saves, R + Y loads. Held R avoids accidental presses mid-jump. */
     if ((k & KEY_R) && (keysDown() & KEY_X))

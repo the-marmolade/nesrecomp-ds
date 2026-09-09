@@ -3,6 +3,7 @@
 #include <filesystem.h>
 #include <stdio.h>
 #include <stdint.h>
+#include "game_config.h"
 
 extern void func_RESET(void);
 extern void func_NMI(void);
@@ -33,14 +34,28 @@ int main(void) {
      * need somewhere to write. */
     g_fat_ready = fatInitDefault() ? 1 : 0;
 
-    if (nitroFSInit(NULL) && nes_rom_load("nitro:/smb.nes")) {
-        iprintf("ROM loaded from NitroFS\n");
-    } else if (g_fat_ready &&
-               (nes_rom_load("/smb.nes") || nes_rom_load("fat:/smb.nes"))) {
-        iprintf("ROM loaded from SD\n");
-    } else {
-        iprintf("could not load smb.nes\n");
-        while (1) swiWaitForVBlank();
+    {
+        char path[64];
+        int loaded = 0;
+
+        siprintf(path, "nitro:/%s", g_game->rom_file);
+        if (nitroFSInit(NULL) && nes_rom_load(path)) {
+            iprintf("ROM loaded from NitroFS\n");
+            loaded = 1;
+        }
+        if (!loaded && g_fat_ready) {
+            siprintf(path, "/%s", g_game->rom_file);
+            if (nes_rom_load(path)) loaded = 1;
+            if (!loaded) {
+                siprintf(path, "fat:/%s", g_game->rom_file);
+                if (nes_rom_load(path)) loaded = 1;
+            }
+            if (loaded) iprintf("ROM loaded from SD\n");
+        }
+        if (!loaded) {
+            iprintf("could not load %s\n", g_game->rom_file);
+            while (1) swiWaitForVBlank();
+        }
     }
     video_init();
     nes_timing_init();

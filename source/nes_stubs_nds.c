@@ -55,3 +55,19 @@ void runtime_end_post_nmi(void)   { }
 /* Debug label for the last recompiled function entered. Only referenced by
  * mapper.c's MMC3 bank-switch logging, which NROM never reaches. */
 const char *g_last_recomp_func = "(none)";
+/* Add to source/nes_stubs_nds.c.
+ *
+ * Called when the game dispatches to an address the coverage run never
+ * reached, so the whitelist build has no case for it. This must be loud: the
+ * whitelist is a lower bound drawn from what the test scripts happened to
+ * execute, and a path they missed would otherwise vanish silently and leave
+ * you debugging a game that quietly does nothing.
+ *
+ * Returning 0 matches the old stub's behaviour, so the game limps on rather
+ * than crashing - but the address is on screen, and it maps straight into
+ * symbols.sym the same way $8150 resolved to Sprite0Hit. */
+int nes_dispatch_pruned(uint16_t addr) {
+    static int n;
+    if (n < 16) { iprintf("PRUNED %04X\n", addr); n++; }
+    return 0;
+}

@@ -58,12 +58,20 @@ endif
 # its include and source paths as $(CURDIR)/$(dir), so an absolute path here
 # gets concatenated onto CURDIR and resolves to nothing. ROOTDIR is only used
 # to validate them below, where an absolute path is what we want.
-GAME_DIR      ?= ..
+# Which game's settings to compile in (see source/game_config.c).
+GAME          ?= smb
+GAME_DEFINE   := -DGAME_$(shell echo $(GAME) | tr '[:lower:]' '[:upper:]')
+
+# Self-contained by default: nesrecomp is a submodule of this repo, and each
+# ported game's recompiled C lives under games/<name>/generated (written by
+# tools/port.sh). Nothing outside this directory is needed.
+GAME_DIR      ?= games/$(GAME)
 GENERATED_DIR ?= $(GAME_DIR)/generated
-NESRECOMP_INC ?= $(GAME_DIR)/nesrecomp/runner/include
+NESRECOMP_DIR ?= nesrecomp
+NESRECOMP_INC ?= $(NESRECOMP_DIR)/runner/include
 
 ifeq ($(wildcard $(ROOTDIR)/$(GENERATED_DIR)/.),)
-$(error Cannot find $(ROOTDIR)/$(GENERATED_DIR) - this runner needs a nesrecomp game project, see the README. Override with: make GAME_DIR=../path/to/SuperMarioBrosNESRecomp)
+$(error No recompiled game at $(GENERATED_DIR) - run: bash tools/port.sh <rom.nes> $(GAME))
 endif
 
 ifeq ($(wildcard $(ROOTDIR)/source/mapper.c),)
@@ -71,7 +79,7 @@ $(error source/mapper.c missing - run: bash tools/fetch_deps.sh)
 endif
 
 ifeq ($(wildcard $(ROOTDIR)/$(NESRECOMP_INC)/nes_runtime.h),)
-$(error Cannot find nes_runtime.h in $(ROOTDIR)/$(NESRECOMP_INC) - did you run setup.sh in the game project to fetch the nesrecomp submodule?)
+$(error Cannot find nes_runtime.h in $(NESRECOMP_INC) - run: git submodule update --init)
 endif
 
 TARGET   := nesrecomp-ds
@@ -93,7 +101,7 @@ ARCH := -mthumb -march=armv5te -mtune=arm946e-s
 
 CFLAGS := -g -w -Os -ffunction-sections -fdata-sections -std=gnu11 \
 		-DNESRECOMP_SPLIT_PARTS_EXTERNAL \
-		$(ARCH) $(INCLUDE) -DARM9
+		$(ARCH) $(INCLUDE) -DARM9 $(GAME_DEFINE)
 CXXFLAGS := $(CFLAGS) -fno-rtti -fno-exceptions
 ASFLAGS  := -g $(ARCH)
 LDFLAGS	=	-Wl,-T,/c/dev/smbrecomp/runner-nds/nesrecomp_ds9.ld -specs=ds_arm9.specs -g $(ARCH) -Wl,--gc-sections -Wl,-Map,$(notdir $*.map)

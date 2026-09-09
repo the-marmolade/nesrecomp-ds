@@ -7,3 +7,4 @@ nitrofiles/
 build.log
 coverage.txt
 source/mapper.c
+games/

@@ -6,12 +6,11 @@
 # vendored here - that way it tracks upstream rather than drifting.
 set -eu
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-GAME_DIR="${GAME_DIR:-$ROOT/..}"
-SRC="$GAME_DIR/nesrecomp/runner/src/mapper.c"
+SRC="${NESRECOMP:-$ROOT/nesrecomp}/runner/src/mapper.c"
 
 if [ ! -f "$SRC" ]; then
   echo "Cannot find $SRC"
-  echo "Run setup.sh in the game project first, or set GAME_DIR."
+  echo "Run: git submodule update --init"
   exit 1
 fi
 
