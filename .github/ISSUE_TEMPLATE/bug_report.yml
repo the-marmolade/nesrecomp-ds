@@ -1,3 +1,12 @@
+# Destination: .github/ISSUE_TEMPLATE/bug_report.yml
+#
+# This is a GitHub issue *form*, not a markdown template. Forms render as real
+# input fields, can mark inputs required, and auto-apply labels — markdown
+# templates just dump a skeleton into the box that reporters delete half of.
+#
+# Only four fields are required. Every required field is friction, and friction
+# on a homebrew project means the report doesn't get filed at all.
+
 name: Bug report
 description: Something behaves incorrectly, crashes, or looks wrong
 labels: ["type:bug"]
@@ -28,9 +37,14 @@ body:
     attributes:
       label: Build version
       description: >
-        A release tag, or the commit SHA you built from (`git rev-parse --short HEAD`).
-        "Latest" isn't enough — I can't tell which latest you mean.
-      placeholder: "v0.3.1, or a1b2c3d"
+        Shown on the bottom screen when the game boots, and in the debug overlay
+        (press L) — for example `0247 RoseLemon 04b0f9ce`. It is also in the .nds
+        filename. Please copy all of it: the number and codename come from the
+        commit, so they identify exactly what you were running.
+
+        A trailing `+` means the build had uncommitted changes — worth saying so,
+        because that build does not correspond to anything I can check out.
+      placeholder: "0247 RoseLemon 04b0f9ce"
     validations:
       required: true
 
@@ -57,9 +71,9 @@ body:
       required: true
 
   - type: dropdown
-    id: display_mode
+    id: game_mode
     attributes:
-      label: Display mode
+      label: Game mode
       options:
         - Arranged (playfield top, HUD on sub screen)
         - Original (whole frame on one screen)
