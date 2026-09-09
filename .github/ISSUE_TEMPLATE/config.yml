@@ -1,0 +1,6 @@
+blank_issues_enabled: true
+
+contact_links:
+  - name: Known deviations from real hardware
+    url: https://github.com/the-marmolade/nesrecomp-ds#known-deviations
+    about: Some differences are deliberate — check here before filing a bug.
