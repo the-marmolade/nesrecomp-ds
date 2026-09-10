@@ -22,6 +22,7 @@ extern void card_set_busy(int busy);
 extern void power_check_lid(void);
 extern void card_check(void);
 extern uint8_t g_ram[];
+extern uint8_t nes_read(uint16_t addr);
 
 /* How the NES frame is presented. 240 lines cannot fit 192 without losing
  * something, and the two ways of losing it suit different tastes, so the
@@ -60,21 +61,30 @@ static int s_drawn;
 
 /* ---- progress bar -------------------------------------------------------
  *
- * $006D Player_PageLoc and $0086 Player_X_Position give the player's position
- * as page * 256 + x. $0770 OperMode is 1 during gameplay.
+ *   $006D Player_PageLoc + $0086 Player_X_Position  position as page*256 + x
+ *   $0750 AreaPointer                               which area is loaded
+ *   $075B HalfwayPage                               checkpoint page, 0 if none
+ *   $0770 OperMode                                  1 during gameplay
  *
- * Level length is the awkward part: SMB has no single "how long is this
- * level" value in RAM - the area data is a stream of objects terminated by a
- * loop command, and working out the end means walking it. Most levels finish
- * between pages 12 and 14, so the bar is scaled to a nominal length and
- * clamped. That makes it a sense of progress rather than a measurement, which
- * is what a progress bar is for; a level that runs long simply sits at full
- * for its last stretch. */
+ * The bar restarts whenever AreaPointer changes. That covers both cases worth
+ * covering: a new level, and ducking into a pipe - SMB loads a sub-area for
+ * the underground and underwater rooms, so the same value moves for both. A
+ * bar that kept counting from the level start would show a pipe as progress
+ * backwards, since sub-areas begin at page 0 again.
+ *
+ * Level length is the awkward part: SMB has no "how long is this level" value
+ * anywhere. The area data is a stream of objects terminated by a loop command,
+ * and finding the end means walking it. Most levels finish between pages 12
+ * and 14, so the bar is scaled to a nominal length and clamped - a sense of
+ * progress rather than a measurement, which is what a progress bar is for. */
 #define BAR_ROW        8
 #define BAR_W         26
 #define NOMINAL_PAGES 13
 
 static int s_last_fill = -1;
+static int s_last_mark = -1;
+static u8  s_last_area = 0xFF;
+static int s_reached_half;   /* latched once the checkpoint is passed */
 
 static void draw_progress(void) {
     if (g_ram[0x0770] != 1) {          /* not in gameplay */
@@ -85,18 +95,75 @@ static void draw_progress(void) {
         return;
     }
 
+    /* A change of area means a new level or a pipe. Start the bar again. */
+    u8 area = g_ram[0x0750];
+    if (area != s_last_area) {
+        s_last_area = area;
+        s_last_fill = -1;
+        s_last_mark = -1;
+        s_reached_half = 0;
+    }
+
     int pos   = g_ram[0x006D] * 256 + g_ram[0x0086];
     int total = NOMINAL_PAGES * 256;
     int fill  = pos * BAR_W / total;
     if (fill < 0)     fill = 0;
     if (fill > BAR_W) fill = BAR_W;
 
-    if (fill == s_last_fill) return;   /* console writes are not free */
+    /* Checkpoint marker.
+     *
+     * $075B HalfwayPage looked like the obvious source, but SMB only writes it
+     * as part of losing a life - it records where to respawn, so the marker
+     * appeared after dying rather than on passing the checkpoint.
+     *
+     * The real per-level value is in ROM: HalfwayPageNybbles at $91BD, 16
+     * bytes holding one nybble for each of the 32 levels. GetHalfway indexes
+     * it by world*2 + level/2 and picks the nybble by the low bit of the
+     * level number. Reading it directly gives the marker from the moment a
+     * level loads. */
+    int mark = -1;
+    {
+        u8 world = g_ram[0x075F];
+        u8 level = g_ram[0x075C];
+        u8 page;
+
+        if (world < 8) {
+            u8 byte = nes_read((uint16_t)(0x91BD + world * 2 + (level >> 1)));
+            page = (level & 1) ? (byte & 0x0F) : (byte >> 4);
+        } else {
+            page = g_ram[0x075B];      /* out of range - fall back */
+        }
+
+        /* Only shown once the player has actually passed it, and then it
+         * stays for the rest of the level - the way a NSMB checkpoint flag
+         * does. Hiding it beforehand keeps it a reward rather than a spoiler;
+         * latching it means it does not flicker out if the player walks back
+         * a few steps.
+         *
+         * $075B being set means the player respawned mid-level, so the
+         * checkpoint was reached on a previous life. */
+        if (page) {
+            if (g_ram[0x006D] >= page || g_ram[0x075B]) s_reached_half = 1;
+
+            if (s_reached_half) {
+                mark = (page * 256) * BAR_W / total;
+                if (mark < 0)      mark = 0;
+                if (mark >= BAR_W) mark = BAR_W - 1;
+            }
+        }
+    }
+
+    if (fill == s_last_fill && mark == s_last_mark) return;  /* writes cost time */
     s_last_fill = fill;
+    s_last_mark = mark;
 
     char bar[BAR_W + 3];
     bar[0] = '[';
-    for (int i = 0; i < BAR_W; i++) bar[i + 1] = (i < fill) ? '=' : '.';
+    for (int i = 0; i < BAR_W; i++) {
+        if (i == mark)      bar[i + 1] = '|';   /* checkpoint */
+        else if (i < fill)  bar[i + 1] = '=';
+        else                bar[i + 1] = '.';
+    }
     bar[BAR_W + 1] = ']';
     bar[BAR_W + 2] = 0;
     iprintf("\x1b[%d;2H%s", BAR_ROW, bar);
