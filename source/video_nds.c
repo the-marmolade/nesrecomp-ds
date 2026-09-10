@@ -39,10 +39,7 @@
 static int s_scroll_y_base;
 static int s_scroll_x;          /* playfield scroll, set once per frame */
 
-volatile unsigned g_hblank_hits;   /* diagnostic: is the handler running? */
-
 static void hblank_squeeze(void) {
-    g_hblank_hits++;
     int v = REG_VCOUNT;
     if (v >= 192) return;
 

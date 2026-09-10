@@ -344,13 +344,6 @@ int nes_load_state(void) {
     return 1;
 }
 
-/* Diagnostics for issue #13: status-bar text is appearing in the playfield,
- * so a $2007 run is landing at the wrong nametable address. The three things
- * that decide where it lands. */
-int  nes_dbg_mirroring(void) { return s_mirroring; }
-int  nes_dbg_ppuaddr(void)   { return s_ppuaddr; }
-int  nes_dbg_toggle(void)    { return s_wtoggle; }
-
 uint16_t nes_read16zp(uint8_t zp) {
     return (uint16_t)g_ram[zp] | ((uint16_t)g_ram[(uint8_t)(zp + 1)] << 8);
 }
@@ -362,8 +355,12 @@ static void poll_input(void) {
     scanKeys();
     int k = keysHeld();
     uint8_t b = 0;
-    if (k & KEY_A)      b |= 0x01;   /* NES A — jump */
-    if (k & KEY_B)      b |= 0x02;   /* NES B — run/fire */
+    /* New Super Mario Bros. layout: either right-hand face button jumps, and
+     * the other pair runs. On the NES both were single buttons, but the DS has
+     * four in that cluster and NSMB used them this way - jump on A or B,
+     * dash on X or Y - so a thumb never has to travel. */
+    if (k & (KEY_A | KEY_B)) b |= 0x01;   /* NES A - jump  */
+    if (k & (KEY_X | KEY_Y)) b |= 0x02;   /* NES B - run   */
     if (k & KEY_SELECT) b |= 0x04;
     if (k & KEY_START)  b |= 0x08;
     if (k & KEY_UP)     b |= 0x10;
@@ -378,7 +375,9 @@ static void poll_input(void) {
     }
 
     /* R + B toggles a known A440 test tone, for checking PSG_SCALE. */
-    if ((k & KEY_R) && (keysDown() & KEY_B)) apu_test_tone_toggle();
+    /* Moved off B: B is now a gameplay button (jump), so R+B fired the test
+     * tone every time someone jumped with R held. R+Down is unused. */
+    if ((k & KEY_R) && (keysDown() & KEY_DOWN)) apu_test_tone_toggle();
 
     /* R + Up hides all sprites: tells background corruption from sprite
      * corruption in one press. */
@@ -407,10 +406,11 @@ void maybe_trigger_vblank(int cycles) {
         /* Still inside func_NMI a whole frame later — it isn't returning.
          * Report where the 6502 is spinning instead of hanging silently. */
         s_ops -= CYCLES_PER_FRAME;
-        if ((++s_defer_count % 30) == 1)
-            iprintf("in NMI %lu frames, pc=%04X A=%02X X=%02X Y=%02X\n",
-                    (unsigned long)s_defer_count, s_last_pc,
-                    g_cpu.A, g_cpu.X, g_cpu.Y);
+        /* Was printed unconditionally, which made it the one piece of debug
+         * output a normal player could see - it turned up under the save
+         * buttons in bug reports. Counted only; the overlay can show it if
+         * this ever needs chasing again. */
+        s_defer_count++;
         return;
     }
 
@@ -452,7 +452,6 @@ void maybe_trigger_vblank(int cycles) {
      * tears and flickers. func_NMI() is most of a frame's work, so waiting
      * first (as this used to) put the writes right in the middle of display. */
     power_check_lid();      /* sleeps here if the lid is shut */
-    card_check();           /* halts if the DS card was removed */
     ui_frame();             /* touch save/load; blocks while confirming */
     video_build();          /* heavy work: RAM shadows, outside vblank */
     apu_frame();
@@ -467,6 +466,10 @@ void maybe_trigger_vblank(int cycles) {
     else           swiWaitForVBlank();
 
     video_flush();
+    /* After the VRAM work, not before: the card read is slow, and the frame
+     * has ~8ms of slack left at this point. Running it before video_build
+     * pushed the whole frame past its budget and cost a vblank. */
+    card_check();           /* halts if the DS card was removed */
 
     s_rate_acc += NES_RATE_FRAC;
     if (s_rate_acc >= NES_RATE_ONE) {
@@ -478,7 +481,6 @@ void maybe_trigger_vblank(int cycles) {
      * RESET spin-wait at $800A never sees it and the game never starts. */
 
     if ((++g_frame_count % 60) == 0) {
-        /* Average first, then scale — 60 * 65535 * 3052 overflows 32 bits. */
         /* Average first, then scale. fps is kept x100: integer 1000000/us
          * lands right on the 59/60 boundary and flips with rounding, which
          * looks like instability when the timing is actually fine. */
@@ -494,19 +496,9 @@ void maybe_trigger_vblank(int cycles) {
                     (unsigned long)(s_fps / 100), (unsigned long)(s_fps % 100),
                     (unsigned long)(s_work_us / 1000),
                     (unsigned long)((s_work_us % 1000) / 10));
-            {   extern volatile unsigned g_hblank_hits;
-                extern int g_original_mode;
-                iprintf("hblank %u  orig=%d      \n",
-                        g_hblank_hits, g_original_mode);
-                g_hblank_hits = 0;
-            }
             iprintf("build %s %s            \n", BUILD_ID, BUILD_NAME);
-            iprintf("mir=%d inc=%d addr=%04X tog=%d  \n",
-                    nes_dbg_mirroring(), (g_ppuctrl & 0x04) ? 32 : 1,
-                    nes_dbg_ppuaddr(), nes_dbg_toggle());
             iprintf("om=%02X ot=%02X srt=%02X ges=%02X  \n",
                     g_ram[0x0770], g_ram[0x0772], g_ram[0x073C], g_ram[0x000E]);
-            /* Should read ~60.1, not 59.8, once rate matching is working. */
         }
     }
 }
