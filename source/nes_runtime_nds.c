@@ -24,6 +24,9 @@ extern void power_check_lid(void);
 extern void ui_frame(void);
 extern int  g_hide_sprites;
 extern void card_check(void);
+extern void debug_level_select(void);
+extern void debug_state_line(void);
+extern int  g_debug_extra;
 extern void apu_test_tone_toggle(void);
 extern unsigned apu_state_size(void);
 extern void apu_state_save(void *dst);
@@ -63,10 +66,11 @@ uint64_t g_frame_count = 0;
  * a single second). */
 static int      s_debug_on;
 static uint32_t s_work_acc;      /* summed work ticks over 60 frames  */
+static uint16_t s_work_peak;     /* worst single frame in the window     */
 static uint32_t s_total_acc;     /* summed frame PERIODS, start to start */
 static uint16_t s_last_start;    /* previous frame's start tick */
 static int      s_have_last;
-static uint32_t s_fps, s_work_us;
+static uint32_t s_fps, s_work_us, s_work_peak_us;
 
 /* One 16-bit timer at DIV_1024: 33513982/1024 = 32729 Hz, so a tick is
  * ~30.5us and it wraps every 2 seconds. Unsigned 16-bit subtraction wraps
@@ -369,7 +373,9 @@ static void poll_input(void) {
     if (k & KEY_RIGHT)  b |= 0x80;
     g_controller1_buttons = b;
 
-    if (keysDown() & KEY_L) {
+    /* Not while R is held - L+R is the level select, and toggling the overlay
+     * on the way into it is just noise. */
+    if ((keysDown() & KEY_L) && !(k & KEY_R)) {
         s_debug_on = !s_debug_on;
         if (!s_debug_on) iprintf("\x1b[2J");   /* clear on the way out */
     }
@@ -378,6 +384,13 @@ static void poll_input(void) {
     /* Moved off B: B is now a gameplay button (jump), so R+B fired the test
      * tone every time someone jumped with R held. R+Down is unused. */
     if ((k & KEY_R) && (keysDown() & KEY_DOWN)) apu_test_tone_toggle();
+
+    /* L + R opens the level select. Reaching world 8 legitimately takes an
+     * hour, and several test cases need specific levels. */
+    if ((k & KEY_L) && (keysDown() & KEY_R)) debug_level_select();
+
+    /* R + Right toggles the extra state line. */
+    if ((k & KEY_R) && (keysDown() & KEY_RIGHT)) g_debug_extra = !g_debug_extra;
 
     /* R + Up hides all sprites: tells background corruption from sprite
      * corruption in one press. */
@@ -389,7 +402,8 @@ static void poll_input(void) {
     /* R + Select arms APU tracing, R + L writes it out. Not on by default:
      * the console chatter gets in the way of audio recording. */
     if ((k & KEY_R) && (keysDown() & KEY_SELECT)) apu_trace_start();
-    if ((k & KEY_R) && (keysDown() & KEY_L))      apu_trace_dump_now();
+    /* Moved off R+L, which is now the level select. */
+    if ((k & KEY_R) && (keysDown() & KEY_LEFT))   apu_trace_dump_now();
 
     /* Save and load moved to the touch screen (see ui_nds.c). The old R+X /
      * R+Y combos are gone: undiscoverable, and loading fired instantly with
@@ -458,7 +472,11 @@ void maybe_trigger_vblank(int cycles) {
 
     /* Work time excludes the vblank wait: it is what we spend emulating and
      * building the frame, so anything approaching 16.7ms means dropped frames. */
-    s_work_acc += (uint16_t)(tmr() - t_start);
+    {
+        uint16_t w = (uint16_t)(tmr() - t_start);
+        s_work_acc += w;
+        if (w > s_work_peak) s_work_peak = w;
+    }
 
     /* Skip the wait on a catch-up frame so two NES frames land inside one
      * DS frame; the first one's output is simply overwritten. */
@@ -487,7 +505,9 @@ void maybe_trigger_vblank(int cycles) {
         uint32_t frame_us = ticks_to_us(s_total_acc / 60u);
         s_work_us = ticks_to_us(s_work_acc  / 60u);
         s_fps     = frame_us ? (100000000u / frame_us) : 0;
+        s_work_peak_us = ticks_to_us(s_work_peak);
         s_work_acc = s_total_acc = 0;
+        s_work_peak = 0;
 
         if (s_debug_on) {
             /* Home the cursor instead of scrolling — scrolling the console is
@@ -496,9 +516,14 @@ void maybe_trigger_vblank(int cycles) {
                     (unsigned long)(s_fps / 100), (unsigned long)(s_fps % 100),
                     (unsigned long)(s_work_us / 1000),
                     (unsigned long)((s_work_us % 1000) / 10));
-            iprintf("build %s %s            \n", BUILD_ID, BUILD_NAME);
+            /* Peak, not just mean: with vsync a single frame over 16.7ms
+             * costs a whole vblank, and an average can hide that. */
+            iprintf("peak %2lu.%02lums  build %s     \n",
+                    (unsigned long)(s_work_peak_us / 1000),
+                    (unsigned long)((s_work_peak_us % 1000) / 10), BUILD_ID);
             iprintf("om=%02X ot=%02X srt=%02X ges=%02X  \n",
                     g_ram[0x0770], g_ram[0x0772], g_ram[0x073C], g_ram[0x000E]);
+            if (g_debug_extra) debug_state_line();
         }
     }
 }
