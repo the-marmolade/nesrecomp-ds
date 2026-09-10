@@ -8,3 +8,17 @@ build.log
 coverage.txt
 source/mapper.c
 games/
+include/build_number.h
+*-b[0-9]*.nds
+include/build_number.h
+build_id.txt
+build_name.txt
+*-[0-9][0-9][0-9][0-9]-*.nds
+build_number.txt
+include/build_number.h
+*-b[0-9]*.nds
+include/build_number.h
+build_id.txt
+build_name.txt
+*-[0-9][0-9][0-9][0-9]-*.nds
+build_number.txt

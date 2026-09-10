@@ -23,6 +23,19 @@
  * That costs one line in five, which is visible on fine detail - the trade
  * for showing the frame the way the NES did, HUD and all. Arranged mode
  * keeps every pixel by putting the HUD on the sub screen instead. */
+/* The title screen has content from line 8 (the status bar text) down to 224
+ * (the ground) - 216 lines against the top screen's 192, so something has to
+ * give. Splitting it the same way as gameplay is the least-bad option, just
+ * with the boundary moved:
+ *
+ *   lines   0..23   sub screen: the status bar text, 3 rows
+ *   lines  24..215  top screen: the logo, menu and ground
+ *
+ * Starting at 24 rather than 32 recovers the top of the SUPER logo, which was
+ * being sliced off, and nothing is duplicated between the screens. */
+#define TITLE_TOP_LINE 24
+#define TITLE_HUD_ROWS 3
+
 static int s_scroll_y_base;
 static int s_scroll_x;          /* playfield scroll, set once per frame */
 
@@ -70,6 +83,11 @@ static u16     *s_map;
 static int      s_bg_hud;        /* sub-screen BG holding the NES status bar */
 static u16     *s_map_hud;
 static int      s_inited;
+
+/* Debug: hide every sprite. Corrupt tiles that vanish with this are sprites;
+ * anything that remains is background. Those have entirely different causes,
+ * and guessing which is which wastes more time than the toggle costs. */
+int g_hide_sprites;
 
 /* Standard NES system palette, RGB888. */
 static const u8 s_nes_rgb[64][3] = {
@@ -159,12 +177,16 @@ void video_init(void) {
      * base 31 and tile base 0. mapBase is 5 bits (0-31) and tileBase 4 bits
      * (0-15), so: map base 30 = 60-62KB, tile base 2 = 32-48KB. Neither
      * collides with the console or with each other. */
-    if (!g_original_mode)
-        s_bg_hud = bgInitSub(1, BgType_Text4bpp, BgSize_T_256x256, 30, 2);
-    s_map_hud = (u16 *)bgGetMapPtr(s_bg_hud);
-    convert_chr_bg((u16 *)bgGetGfxPtr(s_bg_hud));
-    bgSetScroll(s_bg_hud, 0, 0);
-    bgUpdate();
+    /* Only in arranged mode. Original mode never creates this background, and
+     * s_bg_hud is then 0 - which is the console's BG, so setting it up here
+     * would write tile data over the console's tile memory and scroll it. */
+    if (!g_original_mode) {
+        s_bg_hud  = bgInitSub(1, BgType_Text4bpp, BgSize_T_256x256, 30, 2);
+        s_map_hud = (u16 *)bgGetMapPtr(s_bg_hud);
+        convert_chr_bg((u16 *)bgGetGfxPtr(s_bg_hud));
+        bgSetScroll(s_bg_hud, 0, 0);
+        bgUpdate();
+    }
 
     /* Drop the console below the 4 HUD rows so both are readable. */
     consoleSetWindow(NULL, 0, 4, 32, 20);
@@ -226,6 +248,18 @@ void video_build(void) {
         for (int c = 1; c < 4; c++)
             s_pal_sub[(p + 4) * 16 + c] = nes_color(g_ppu_pal[p * 4 + c]);
 
+    /* The two-screen split assumes NES lines 0-31 are a status bar. That is
+     * only true during gameplay: on the title screen those lines are the top
+     * of the logo, and slicing them off to the sub screen cuts the logo and
+     * puts a meaningless score readout under it.
+     *
+     * $0770 OperMode is 1 during gameplay, 0 on the title/demo. Off the
+     * playfield, show the frame from near the top and leave the sub screen
+     * empty. */
+    int in_game  = (g_ram[0x0770] == 1);
+    int top_line = in_game ? g_game->top_line : TITLE_TOP_LINE;
+    int hud_rows = in_game ? g_game->hud_lines / 8 : TITLE_HUD_ROWS;
+
     int bg_base  = (g_ppuctrl & 0x10) ? 256 : 0;
     int spr_base = (g_ppuctrl & 0x08) ? 256 : 0;
 
@@ -238,31 +272,46 @@ void video_build(void) {
      * every frame where that bit points elsewhere. */
     {
         const u8 *nt = &g_ppu_nt[g_game->hud_nametable ? 0x400 : 0x000];
-        int hud_rows = g_game->hud_lines / 8;
-        for (int row = 0; row < hud_rows; row++)
+        for (int row = 0; row < 4; row++)
             for (int col = 0; col < 32; col++) {
-                u8 t = nt[row * 32 + col];
+                /* Rows past hud_rows are blanked rather than left stale - on
+                 * the title screen row 3 belongs to the logo, and showing it
+                 * here as well would duplicate it on both screens. */
+                u8 t = (row < hud_rows) ? nt[row * 32 + col] : 0x24;
                 s_shadow_hud[row * 32 + col] =
                     (u16)(bg_base + t) | (u16)((attr_for(nt, col, row) + 4) << 12);
             }
     }
 
     s_scroll_x = g_ppuscroll_x + ((g_ppuctrl & 1) ? 256 : 0);
-    s_scroll_y_base = g_original_mode ? 0 : g_game->top_line;
+
+    /* The NES vertical scroll was being captured into g_ppuscroll_y and then
+     * never read, so anything the game scrolled vertically came out clipped -
+     * the sliced top of the title logo in issue #13. SMB uses it on the title
+     * screen and around the underground and water transitions.
+     *
+     * Only 0-239 is a real scroll position. Writing 240-255 does not shift
+     * the picture up - on hardware the PPU starts reading attribute bytes as
+     * if they were tiles - and SMB writes 248 on the title screen as a
+     * scratch value rather than as a scroll. Treating it as -8 moved the
+     * status bar onto the top screen, so out-of-range values are ignored. */
+    int sy = g_ppuscroll_y;
+    if (sy >= 240) sy = 0;
+    s_scroll_y_base = (g_original_mode ? 0 : top_line) + sy;
 
     /* oamSet writes into libnds' RAM copy; oamUpdate DMAs it in vblank. */
     for (int i = 0; i < 64; i++) {
         const u8 *o = &g_ppu_oam[i * 4];
         int ny = o[0] + 1;
         int y;
-        if (!g_original_mode)      y = ny - g_game->top_line;
+        if (!g_original_mode)      y = ny - top_line - sy;
         else if (ny < 32) y = ny;                       /* HUD, 1:1 */
         else              y = 32 + (ny - 32) * 3 / 4;   /* playfield, 3/4 */
         int x = o[3];
         u8  tile = o[1], attr = o[2];
         int hflip = (attr & 0x40) != 0;
         int vflip = (attr & 0x80) != 0;
-        int hidden = (o[0] >= 0xEF) || (y < -8) || (y > 192);
+        int hidden = (o[0] >= 0xEF) || (y < -8) || (y > 192) || g_hide_sprites;
         oamSet(&oamMain, i, x, y,
                (attr & 0x20) ? 2 : 0, attr & 3,
                SpriteSize_8x8, SpriteColorFormat_16Color,
@@ -274,6 +323,19 @@ void video_build(void) {
 /* Phase 2: runs inside vblank. DMA only — no computation. */
 void video_flush(void) {
     if (!s_inited) return;
+
+    /* Flush the shadow buffers out of the data cache before DMA reads them.
+     *
+     * video_build() writes these through the ARM9's cache; dmaCopy reads main
+     * RAM directly and does not see cache. Anything still dirty never reaches
+     * VRAM, which shows up as stale or garbled tiles in bands - and only on
+     * real hardware, because emulators have no cache to be out of sync with.
+     * That is exactly the shape of issue #13. */
+    DC_FlushRange(s_shadow,     sizeof s_shadow);
+    DC_FlushRange(s_shadow_hud, sizeof s_shadow_hud);
+    DC_FlushRange(s_pal_bg,     sizeof s_pal_bg);
+    DC_FlushRange(s_pal_spr,    sizeof s_pal_spr);
+    DC_FlushRange(s_pal_sub,    sizeof s_pal_sub);
     dmaCopy(s_shadow,     s_map,          sizeof s_shadow);
     if (!g_original_mode)
         dmaCopy(s_shadow_hud, s_map_hud, sizeof s_shadow_hud);

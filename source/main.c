@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include "game_config.h"
+#include "build_number.h"
 
 extern void func_RESET(void);
 extern void func_NMI(void);
@@ -14,6 +15,7 @@ extern void video_init(void);
 extern void nes_timing_init(void);
 extern void apu_init(void);
 extern void power_init(void);
+extern void card_init(void);
 extern int  ui_select_mode(void);
 extern int  g_fat_ready;
 
@@ -59,6 +61,8 @@ int main(void) {
             while (1) swiWaitForVBlank();
         }
     }
+    iprintf("build %s %s  %s\n", BUILD_ID, BUILD_NAME, BUILD_SHA);
+
     /* Ask before initialising video: the two modes set the hardware up
      * differently, and original mode never creates the sub-screen HUD. */
     ui_select_mode();
@@ -67,6 +71,9 @@ int main(void) {
     nes_timing_init();
     apu_init();
     power_init();
+    /* Baseline the card AFTER the ROM has loaded, so any card access libfat
+     * did on the way up is finished. */
+    card_init();
 
 
     func_RESET();

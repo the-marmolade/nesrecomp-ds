@@ -18,6 +18,7 @@
 extern int  nes_save_state(void);
 extern int  nes_load_state(void);
 extern void apu_silence(void);
+extern void card_set_busy(int busy);
 extern uint8_t g_ram[];
 
 /* How the NES frame is presented. 240 lines cannot fit 192 without losing
@@ -209,13 +210,20 @@ void ui_frame(void) {
     touchRead(&t);
 
     if (hit(t.px, t.py, SAVE_X0, SAVE_X1, BTN_ROW)) {
-        if (confirm("Overwrite saved game?"))
+        if (confirm("Overwrite saved game?")) {
+            /* The card check probes the same bus libfat is about to use. */
+            card_set_busy(1);
             report(nes_save_state() ? "saved       " : "save failed ");
+            card_set_busy(0);
+        }
         else
             report("            ");
     } else if (hit(t.px, t.py, LOAD_X0, LOAD_X1, BTN_ROW)) {
-        if (confirm("Load saved game?"))
+        if (confirm("Load saved game?")) {
+            card_set_busy(1);
             report(nes_load_state() ? "loaded      " : "no save     ");
+            card_set_busy(0);
+        }
         else
             report("            ");
     }

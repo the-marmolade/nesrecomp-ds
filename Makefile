@@ -222,7 +222,11 @@ endif
 #---------------------------------------------------------------------------------
 $(BUILD):
 	@mkdir -p $@
+	@bash $(CURDIR)/tools/bump_build.sh
 	@$(MAKE) --no-print-directory -C $(BUILD) -f $(CURDIR)/Makefile
+	@cp $(TARGET).nds \
+	  $(GAME)-$(TARGET)-$$(cat $(CURDIR)/build_id.txt)-$$(cat $(CURDIR)/build_name.txt).nds
+	@echo "-> $(GAME)-$(TARGET)-$$(cat $(CURDIR)/build_id.txt)-$$(cat $(CURDIR)/build_name.txt).nds"
 
 #---------------------------------------------------------------------------------
 clean:

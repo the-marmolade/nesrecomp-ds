@@ -7,6 +7,7 @@
 #include "nes_runtime.h"
 #include "mapper.h"
 #include "game_config.h"
+#include "build_number.h"
 
 extern void func_NMI(void);
 extern void video_init(void);
@@ -21,6 +22,8 @@ extern void apu_trace_dump_now(void);
 extern void apu_trace_start(void);
 extern void power_check_lid(void);
 extern void ui_frame(void);
+extern int  g_hide_sprites;
+extern void card_check(void);
 extern void apu_test_tone_toggle(void);
 extern unsigned apu_state_size(void);
 extern void apu_state_save(void *dst);
@@ -341,6 +344,13 @@ int nes_load_state(void) {
     return 1;
 }
 
+/* Diagnostics for issue #13: status-bar text is appearing in the playfield,
+ * so a $2007 run is landing at the wrong nametable address. The three things
+ * that decide where it lands. */
+int  nes_dbg_mirroring(void) { return s_mirroring; }
+int  nes_dbg_ppuaddr(void)   { return s_ppuaddr; }
+int  nes_dbg_toggle(void)    { return s_wtoggle; }
+
 uint16_t nes_read16zp(uint8_t zp) {
     return (uint16_t)g_ram[zp] | ((uint16_t)g_ram[(uint8_t)(zp + 1)] << 8);
 }
@@ -369,6 +379,13 @@ static void poll_input(void) {
 
     /* R + B toggles a known A440 test tone, for checking PSG_SCALE. */
     if ((k & KEY_R) && (keysDown() & KEY_B)) apu_test_tone_toggle();
+
+    /* R + Up hides all sprites: tells background corruption from sprite
+     * corruption in one press. */
+    if ((k & KEY_R) && (keysDown() & KEY_UP)) {
+        g_hide_sprites = !g_hide_sprites;
+        iprintf("sprites %s\n", g_hide_sprites ? "hidden" : "shown");
+    }
 
     /* R + Select arms APU tracing, R + L writes it out. Not on by default:
      * the console chatter gets in the way of audio recording. */
@@ -435,6 +452,7 @@ void maybe_trigger_vblank(int cycles) {
      * tears and flickers. func_NMI() is most of a frame's work, so waiting
      * first (as this used to) put the writes right in the middle of display. */
     power_check_lid();      /* sleeps here if the lid is shut */
+    card_check();           /* halts if the DS card was removed */
     ui_frame();             /* touch save/load; blocks while confirming */
     video_build();          /* heavy work: RAM shadows, outside vblank */
     apu_frame();
@@ -482,6 +500,10 @@ void maybe_trigger_vblank(int cycles) {
                         g_hblank_hits, g_original_mode);
                 g_hblank_hits = 0;
             }
+            iprintf("build %s %s            \n", BUILD_ID, BUILD_NAME);
+            iprintf("mir=%d inc=%d addr=%04X tog=%d  \n",
+                    nes_dbg_mirroring(), (g_ppuctrl & 0x04) ? 32 : 1,
+                    nes_dbg_ppuaddr(), nes_dbg_toggle());
             iprintf("om=%02X ot=%02X srt=%02X ges=%02X  \n",
                     g_ram[0x0770], g_ram[0x0772], g_ram[0x073C], g_ram[0x000E]);
             /* Should read ~60.1, not 59.8, once rate matching is working. */
