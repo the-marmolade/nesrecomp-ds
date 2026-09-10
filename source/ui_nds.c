@@ -19,6 +19,8 @@ extern int  nes_save_state(void);
 extern int  nes_load_state(void);
 extern void apu_silence(void);
 extern void card_set_busy(int busy);
+extern void power_check_lid(void);
+extern void card_check(void);
 extern uint8_t g_ram[];
 
 /* How the NES frame is presented. 240 lines cannot fit 192 without losing
@@ -131,6 +133,14 @@ static int confirm(const char *question) {
     for (;;) {
         swiWaitForVBlank();
         scanKeys();
+
+        /* These normally run from the frame loop, which is stopped while this
+         * dialog is up. Without them the console cannot sleep on lid close
+         * and does not notice the card being removed - the game just sits
+         * here awake (issue #14). */
+        power_check_lid();
+        card_check();
+
         int keys = keysDown();
 
         if (keys & KEY_TOUCH) {
@@ -180,6 +190,8 @@ int ui_select_mode(void) {
     for (;;) {
         swiWaitForVBlank();
         scanKeys();
+        power_check_lid();      /* the mode picker blocks the frame loop too */
+
         int keys = keysDown();
 
         if (keys & KEY_TOUCH) {
