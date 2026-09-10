@@ -102,8 +102,22 @@ static void draw_progress(void) {
     iprintf("\x1b[%d;2H%s", BAR_ROW, bar);
 }
 
+/* In-game hit test. The console is shifted down by CONSOLE_TOP_ROW to clear
+ * the HUD, so a console row is that many rows lower on screen. */
 static int hit(int px, int py, int x0, int x1, int row) {
     int y0 = ROW_TO_Y(row);
+    return px >= x0 && px <= x1 && py >= y0 && py <= y0 + BTN_H;
+}
+
+/* Boot-menu hit test, without the offset.
+ *
+ * The console window is only shifted down in video_init(), which runs AFTER
+ * the mode picker - so during the picker a console row really is that row on
+ * screen. Using the in-game test here put every hit box 32 pixels below its
+ * label, which landed ARRANGED's box exactly on ORIGINAL's text: whichever
+ * you tapped, you got arranged (issue #12). */
+static int hit_abs(int px, int py, int x0, int x1, int row) {
+    int y0 = row * 8;
     return px >= x0 && px <= x1 && py >= y0 && py <= y0 + BTN_H;
 }
 
@@ -197,8 +211,8 @@ int ui_select_mode(void) {
         if (keys & KEY_TOUCH) {
             touchPosition t;
             touchRead(&t);
-            if (hit(t.px, t.py, 16, 240, 10)) { g_original_mode = MODE_ARRANGED; break; }
-            if (hit(t.px, t.py, 16, 240, 16)) { g_original_mode = MODE_SCALED;   break; }
+            if (hit_abs(t.px, t.py, 16, 240, 10)) { g_original_mode = MODE_ARRANGED; break; }
+            if (hit_abs(t.px, t.py, 16, 240, 16)) { g_original_mode = MODE_SCALED;   break; }
         }
         if (keys & (KEY_A | KEY_START)) { g_original_mode = MODE_ARRANGED; break; }
         if (keys & KEY_B)               { g_original_mode = MODE_SCALED;   break; }
