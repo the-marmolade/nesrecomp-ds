@@ -27,6 +27,8 @@ extern void card_check(void);
 extern void debug_level_select(void);
 extern void debug_state_line(void);
 extern int  g_debug_extra;
+extern unsigned g_card_started, g_card_done, g_card_timeout, g_card_mismatch;
+extern unsigned g_card_last_fp, g_card_base_fp, g_card_overrun;
 extern void apu_test_tone_toggle(void);
 extern unsigned apu_state_size(void);
 extern void apu_state_save(void *dst);
@@ -524,6 +526,13 @@ void maybe_trigger_vblank(int cycles) {
             iprintf("om=%02X ot=%02X srt=%02X ges=%02X  \n",
                     g_ram[0x0770], g_ram[0x0772], g_ram[0x073C], g_ram[0x000E]);
             if (g_debug_extra) debug_state_line();
+            /* Async card probe: started / completed / timed out / mismatched,
+             * then the last fingerprint against the baseline. */
+            iprintf("card s%u d%u t%u m%u o%u  \n",
+                    g_card_started, g_card_done, g_card_timeout,
+                    g_card_mismatch, g_card_overrun);
+            iprintf("fp %08lX base %08lX \n",
+                    (unsigned long)g_card_last_fp, (unsigned long)g_card_base_fp);
         }
     }
 }

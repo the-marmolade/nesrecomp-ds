@@ -24,6 +24,13 @@
 #include <string.h>
 
 #define CARD_CHECK_ENABLED 1
+
+/* 0 - the probe halts again. Set to 1 to watch the counters without halting,
+ * which is how the async overrun was found: the numbers came back impossible
+ * (more completions than starts) and then as 0xFFFFFFFF, which is open-bus
+ * data flooding past the buffer. Worth reaching for before theorising if this
+ * ever misbehaves again. */
+#define CARD_DIAGNOSE 0
 /* Frames between probes. The header read is a card-bus transfer that takes
  * long enough to push its frame past the 16.7ms budget, and with vsync that
  * costs a whole frame rather than a fraction - probing every second measured
@@ -38,6 +45,9 @@
  * register are both trivial - so it can run often again. Kept at 2 seconds
  * rather than every frame because there is no reason to hammer the card bus
  * the flashcart also uses for SD. */
+/* The 4-byte probe is cheap enough to run often. Two seconds keeps removal
+ * detection prompt (4s worst case with two strikes) without hammering a bus
+ * the flashcart also uses for SD. */
 #define CHECK_INTERVAL     120
 
 extern void apu_silence(void);
@@ -47,6 +57,10 @@ static int s_busy;
 static int s_ready;
 static int s_countdown = CHECK_INTERVAL;
 static int s_strikes;
+
+/* Diagnostic counters, read by the debug overlay. */
+unsigned g_card_started, g_card_done, g_card_timeout, g_card_mismatch;
+unsigned g_card_last_fp, g_card_base_fp, g_card_overrun;
 
 /* Which probe to use. cardReadHeader pulls 512 bytes over the card bus and
  * measured expensive enough to cost one frame, sometimes two - the fps
@@ -79,8 +93,44 @@ static int s_strikes;
  * HBlank one. A transfer that never finishes times out and is abandoned - the
  * check quietly stops rather than hanging the console, which is how
  * cardReadID failed. */
-#define PROBE_ASYNC   1
-#define ASYNC_TIMEOUT 60      /* frames to wait before giving up on a read */
+/*
+ * Handing the probe to DMA removed the dropped frame, but broke the feature
+ * in both directions: a card that was pulled no longer halted the game
+ * (#17), because a transfer that never completes was being abandoned rather
+ * than treated as the signal it is; and saving or loading halted the game
+ * falsely (#16), because a probe in flight when libfat took the bus came
+ * back corrupted. Fixing each one individually did not make the pair work.
+ *
+ * The blocking probe costs one dropped frame per read and passes all three
+ * tests - no false halt while playing, no false halt while saving, and a
+ * reliable halt on removal. That is the better trade: a dropped frame every
+ * ten seconds is imperceptible, a feature that silently stops working is
+ * not. */
+/* 0 - abandoned. Handing the read to DMA scribbled 0xFF over memory well past
+ * the destination buffer: the diagnostic counters came back as impossible
+ * values and then as 0xFFFFFFFF outright, which is open-bus data flooding
+ * through a 4KB buffer, through a canary behind it, and into whatever came
+ * next. Three attempts to tame it failed, and the cost of getting it wrong is
+ * silent corruption somewhere unrelated. Left here documented rather than
+ * deleted so nobody tries it again without knowing. */
+#define PROBE_ASYNC   0
+
+/* The real problem was never that the read blocked - it was that it read 512
+ * bytes. cardPolledTransfer takes a length, and the ROMCTRL block-size field
+ * has a setting for a 4-byte transfer. Four bytes is microseconds: it fits in
+ * the frame's slack without costing a vblank, with no DMA, no completion
+ * polling and no buffer to overrun.
+ *
+ * Removal is still detected: with no card, the bus floats high and the read
+ * comes back 0xFFFFFFFF, which is simply a mismatch against the baseline. */
+#define PROBE_SMALL   1
+#ifndef CARD_BLK_SIZE_4BYTE
+#define CARD_BLK_SIZE_4BYTE (7u << 24)
+#endif
+/* A healthy transfer completes within a frame or two. 20 frames is generous
+ * for a working card and keeps removal detection prompt - with two strikes
+ * needed, the worst case is about two probe intervals. */
+#define ASYNC_TIMEOUT 20
 #define ASYNC_DMA_CH  2       /* 3 is libnds' dmaCopy, used by video_flush */
 
 #ifndef CARD_BUSY
@@ -90,7 +140,19 @@ static int s_strikes;
 #define CARD_BLK_SIZE(n) ((n) << 24)
 #endif
 
-static u32 s_async_buf[512 / 4] __attribute__((aligned(4)));
+/* Deliberately eight times larger than the 512 bytes a header read should
+ * produce, and padded after.
+ *
+ * The diagnostic counters came back impossible - more completions than
+ * starts, more mismatches than completions, and a timeout counter wrapped
+ * below zero - which means something was writing past this buffer into the
+ * globals that follow it. The only thing writing here is the card DMA, so it
+ * is transferring more than was allocated for it. Whether the block size in
+ * the ROMCTRL flags means something different to this flashcart or libnds
+ * rounds the length up, the fix is the same: give it room it cannot overrun,
+ * and only ever fingerprint the first 512 bytes. */
+static u32 s_async_buf[4096 / 4] __attribute__((aligned(32)));
+static u32 s_async_guard[64];            /* canary: must stay zero */
 static int s_async_pending;
 static int s_async_wait;
 
@@ -100,15 +162,18 @@ static void async_start(void) {
               | CARD_nRESET;
 
     memset(s_async_buf, 0, sizeof s_async_buf);
+    memset(s_async_guard, 0, sizeof s_async_guard);
+    DC_FlushRange(s_async_buf, sizeof s_async_buf);
     cardStartTransfer(cmd, s_async_buf, ASYNC_DMA_CH, flags);
     s_async_pending = 1;
     s_async_wait = 0;
+    g_card_started++;
 }
 
 static u32 buf_fingerprint(void) {
     const u8 *p = (const u8 *)s_async_buf;
     u32 h = 2166136261u;
-    for (unsigned i = 0; i < sizeof s_async_buf; i++) {
+    for (unsigned i = 0; i < 512; i++) {
         h ^= p[i];
         h *= 16777619u;
     }
@@ -116,7 +181,23 @@ static u32 buf_fingerprint(void) {
 }
 
 static u32 card_fingerprint(void) {
-#if PROBE_WITH_ID
+#if PROBE_SMALL
+    /* Padded well beyond the 4 bytes requested, and checked afterwards: the
+     * async attempt overran its buffer badly, so this one verifies rather
+     * than assumes. */
+    static u32 buf[16];
+    u8 cmd[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };      /* 0x00 = read header */
+    u32 flags = (__NDSHeader->cardControl13 & ~(7u << 24))
+              | CARD_BLK_SIZE_4BYTE | CARD_ACTIVATE | CARD_nRESET;
+
+    memset(buf, 0, sizeof buf);
+    cardPolledTransfer(flags, buf, 1, cmd);
+
+    for (unsigned i = 1; i < 16; i++)
+        if (buf[i]) { g_card_overrun++; break; }
+
+    return buf[0];
+#elif PROBE_WITH_ID
     return cardReadID(0);
 #else
     u8 header[512];
@@ -134,7 +215,7 @@ static u32 card_fingerprint(void) {
 
 void card_init(void) {
 #if CARD_CHECK_ENABLED
-#if PROBE_ASYNC
+#if PROBE_ASYNC && !PROBE_SMALL
     /* Baseline with the async path itself, waiting for it once here. Taking
      * it from cardReadHeader instead would compare fingerprints of two
      * different transfers and mismatch every time. This is the one blocking
@@ -152,7 +233,20 @@ void card_init(void) {
 #endif
 }
 
-void card_set_busy(int busy) { s_busy = busy; }
+void card_set_busy(int busy) {
+    if (busy) {
+        /* libfat is about to use the same bus. Any probe in flight would be
+         * clobbered by it, and reading the result afterwards saw corrupted
+         * data and halted the game mid-save (issue #16). Drop it, and do not
+         * start another until well after the SD work has finished. */
+        s_async_pending = 0;
+        s_strikes = 0;
+        s_countdown = CHECK_INTERVAL;
+    } else {
+        s_countdown = CHECK_INTERVAL;   /* let the bus settle before probing */
+    }
+    s_busy = busy;
+}
 
 static void card_halt(void) {
     apu_silence();
@@ -191,17 +285,38 @@ void card_check(void) {
         if (!(REG_ROMCTRL & CARD_BUSY)) {
             s_async_pending = 0;
             DC_InvalidateRange(s_async_buf, sizeof s_async_buf);
+            g_card_done++;
+
+            /* Did the transfer stay inside its buffer? Any non-zero here
+             * means it overran, and the counters above cannot be trusted. */
+            DC_InvalidateRange(s_async_guard, sizeof s_async_guard);
+            for (unsigned i = 0; i < sizeof s_async_guard / 4; i++)
+                if (s_async_guard[i]) { g_card_overrun++; break; }
 
             u32 fp = buf_fingerprint();
+            g_card_last_fp = fp;
+            g_card_base_fp = s_baseline;
             if (fp != s_baseline) {
+                g_card_mismatch++;
+#if !CARD_DIAGNOSE
                 if (++s_strikes >= 2) card_halt();
+#endif
             } else {
                 s_strikes = 0;
             }
         } else if (++s_async_wait > ASYNC_TIMEOUT) {
-            /* Never completed. Abandon it rather than waiting forever: a
-             * silently disabled check is far better than a frozen console. */
+            /* A transfer that never completes IS the removal signal - with no
+             * card there, nothing answers. Abandoning it quietly (as this did)
+             * meant ejecting the card stopped being detected at all once the
+             * probe went asynchronous (issue #17).
+             *
+             * Still two strikes, so one stalled transfer cannot halt a working
+             * game on its own. */
             s_async_pending = 0;
+            g_card_timeout++;
+#if !CARD_DIAGNOSE
+            if (++s_strikes >= 2) card_halt();
+#endif
         }
         return;
     }
