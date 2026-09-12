@@ -45,10 +45,17 @@
  * register are both trivial - so it can run often again. Kept at 2 seconds
  * rather than every frame because there is no reason to hammer the card bus
  * the flashcart also uses for SD. */
-/* The 4-byte probe is cheap enough to run often. Two seconds keeps removal
- * detection prompt (4s worst case with two strikes) without hammering a bus
- * the flashcart also uses for SD. */
-#define CHECK_INTERVAL     120
+/* Every frame.
+ *
+ * The frame cost was never about the read blocking - it was about reading 512
+ * bytes. Four bytes is microseconds, so probing every frame is affordable and
+ * makes the halt effectively instant: two strikes at 60Hz is about 33ms after
+ * the card leaves the slot, which is as close to immediate as the console can
+ * observe anything.
+ *
+ * Watch peak work time in the overlay if this is ever changed. With vsync a
+ * single frame over 16.7ms costs a whole vblank, and the mean hides it. */
+#define CHECK_INTERVAL     1
 
 extern void apu_silence(void);
 
